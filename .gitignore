@@ -1,1 +1,11 @@
-.idea/*
+# Python venv
+.venv/
+venv/
+
+# 캐시 파일
+__pycache__/
+*.pyc
+
+# IDE 설정
+.idea/
+.vscode/
