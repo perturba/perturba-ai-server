@@ -9,3 +9,6 @@ __pycache__/
 # IDE 설정
 .idea/
 .vscode/
+
+# ml model
+pgd.py
