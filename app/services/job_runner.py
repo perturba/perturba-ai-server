@@ -7,6 +7,7 @@ from io import BytesIO
 import requests
 from PIL import Image
 import torch
+import numpy as np
 
 from app.config import settings
 from app.models.dto import FacePerturbRequest
@@ -81,14 +82,15 @@ def process_face_perturb_job(req: FacePerturbRequest) -> None:
             # 2) PGD + Inpainting 실행
             result = service.run_attack_raw(
                 input_img,
+                intensity=req.intensity,
                 prompt=req.prompt or "",
-                # intensity → eps 매핑을 service 안에서 하든 여기서 하든, 현재 attack 시그니처에 맞춰 조정
             )
+
 
             original_images = result["original_images"]
             perturbed_images = result["perturbed_images"]
-            gen_adv_list = result["gen_adv"]
-            identity_sims = result["identity_similarity"]
+            gen_adv_list = result["gen_adv"]                  # 딥페이크 된 이미지 리스트
+            identity_sims = result.get("identity_similarity", [])
 
             # B=1 가정
             orig_tensor: torch.Tensor = original_images[0]

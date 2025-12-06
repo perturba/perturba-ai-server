@@ -345,8 +345,8 @@ class PGDAttackVAEInpaint:
             "original_images": original_images.detach().cpu(),
             "perturbed_images": perturbed_images,
             "masks": masks,
-            "gen_orig" : gen_ori_list,
-            # "gen_adv": gen_adv_list,
+            #"gen_orig" : gen_ori_list,
+            "gen_adv": gen_adv_list,
             "identity_similarity": similarities
         }
 
