@@ -12,7 +12,9 @@ from facenet_pytorch import InceptionResnetV1
 from torchvision.transforms import ToPILImage
 import torchvision.transforms as T
 from PIL import Image
+from pytorch_msssim import ssim
 
+import math
 
 class PGDAttackVAEInpaint:
     """
@@ -26,8 +28,6 @@ class PGDAttackVAEInpaint:
         self,
         model_id: str = "runwayml/stable-diffusion-inpainting",
         device: Optional[torch.device] = None,
-        eps: float = 2/255,
-        alpha: float = 0.5/255,
         iters: int = 20,
         dtype=torch.float32,
         hf_auth_token: Optional[str] = None,
@@ -76,11 +76,28 @@ class PGDAttackVAEInpaint:
         # loss_fn
 
         self.loss_fn = l2_loss
+        self.ssim = ssim_loss
 
     # -------------------------------------------------------------------------
     # VAE encoder
     # -------------------------------------------------------------------------
     def _image_to_latent(self, images: torch.Tensor) -> torch.Tensor:
+
+        images = images.to(self.device).to(self.dtype)
+        imgs_in = 2.0 * images - 1.0  # [-1,1]
+
+        enc = self.vae.encode(imgs_in)
+        latent_dist = enc.latent_dist
+
+        if hasattr(latent_dist, "rsample"):
+            latents = latent_dist.rsample()
+        else:
+            latents = latent_dist.mean
+
+        latents = latents * self.vae.config.scaling_factor
+        return latents
+
+    def vae_encoding(self, images: torch.Tensor) -> torch.Tensor:
 
         images = images.to(self.device).to(self.dtype)
         imgs_in = 2.0 * images - 1.0  # [-1,1]
@@ -204,8 +221,8 @@ class PGDAttackVAEInpaint:
         original_images: torch.Tensor,
         eps = 8.0,
         prompt: str = "",
-        gen_strength: float = 0.6,
-        gen_guidance_scale: float = 3,
+        gen_strength: float = 0.7,
+        gen_guidance_scale: float = 7,
         gen_steps: int = 30,
     ) -> Dict[str, object]:
 
@@ -223,57 +240,83 @@ class PGDAttackVAEInpaint:
         adv_images = adv_images + torch.empty_like(adv_images).uniform_(-eps, eps)
         adv_images = torch.clamp(adv_images, 0.0, 1.0)
 
+        masks = []
+        
+        for b in range(B):
+            orig = original_images[b].detach().cpu().clamp(0, 1)
+            pil_orig = self.to_pil(orig)
+            mask = self._get_face_binary_mask(pil_orig)
+            masks.append(mask)
+
         if self.verbose:
             print(f"[PGD] Start Attack | iters={self.iters}, eps={eps}")
 
         for i in range(self.iters):
-
+            
             adv_images.requires_grad_(True)
             pert_latents = self._image_to_latent(adv_images)
+            
+            # l2_l = self.loss_fn(orig_latents, pert_latents).mean()
+            # ssim_l = self.ssim(orig_latents, pert_latents)
 
-            loss = self.loss_fn(orig_latents, pert_latents)
-            loss_scalar = loss.mean() if loss.ndim > 0 else loss
+            mask = masks[0]
+            mask = np.array(mask) / 255.0
+            
+            if mask.ndim == 3:
+                mask = mask[..., 0]
+            if mask.shape[:2] != orig_latents.shape[:2]:
+                mask = cv2.resize(mask, (orig_latents.shape[2], orig_latents.shape[3]), interpolation=cv2.INTER_NEAREST)
 
-            (-loss_scalar).backward()
+            mask_tensor = torch.from_numpy(mask).to(self.device).to(self.dtype)  # (H, W)
+            mask_tensor = mask_tensor.unsqueeze(0).repeat(4,1,1)  # (C, H, W)
 
+            masked_orig = orig_latents * mask_tensor
+            masked_pert = pert_latents * mask_tensor
+
+            l2_ml = self.loss_fn(masked_orig, masked_pert).mean()
+            ssim_ml = self.ssim(masked_orig, masked_pert)
+            
+            # total_loss = (-l2_l) + (-l2_ml) + ssim_l + ssim_ml
+            total_loss = (-l2_ml) + ssim_ml
+            total_loss.backward()
+            
+            alpha_t = alpha * (1 + math.cos(math.pi * i / self.iters)) / 2
+            alpha_t = (alpha / 1000) + 0.5 * (alpha - (alpha / 1000)) * (1 + math.cos(math.pi * i / self.iters))
+            
             with torch.no_grad():
-                adv_images = adv_images + alpha * adv_images.grad.sign()
+                adv_images = adv_images + alpha_t * adv_images.grad.sign()
                 delta = torch.clamp(adv_images - original_images, -eps, eps)
                 adv_images = torch.clamp(original_images + delta, 0.0, 1.0).detach()
-
+            
             if self.verbose and (i % 10 == 0 or i == self.iters - 1):
-                print(f"[PGD] iter {i+1}/{self.iters} | loss={loss_scalar.item():.5f}")
-
+                print(f"[PGD] iter {i+1}/{self.iters} | loss={total_loss.item():.5f}")
+        
         perturbed_images = adv_images.detach().cpu()
-
+        
         gen_adv_list = []
         gen_ori_list = []
-        masks = []
         similarities = []
-
+        
         for b in range(B):
-
+        
             orig = original_images[b].detach().cpu().clamp(0, 1)
             adv = perturbed_images[b].clamp(0, 1)
 
             pil_orig = self.to_pil(orig)
             pil_adv = self.to_pil(adv)
-
-            mask = self._get_face_binary_mask(pil_orig)
-            masks.append(mask)
             
-            with torch.no_grad():
-                out = self.pipe(
-                    prompt=prompt,
-                    image=pil_orig,
-                    mask_image=mask,
-                    strength=gen_strength,
-                    guidance_scale=gen_guidance_scale,
-                    num_inference_steps=gen_steps,
-                )
+            # with torch.no_grad():
+            #     out = self.pipe(
+            #         prompt=prompt,
+            #         image=pil_orig,
+            #         mask_image=mask,
+            #         strength=gen_strength,
+            #         guidance_scale=gen_guidance_scale,
+            #         num_inference_steps=gen_steps,
+            #     )
 
-                gen_ori = out.images[0]
-                gen_ori_list.append(gen_ori)
+            #     gen_ori = out.images[0]
+            #     gen_ori_list.append(gen_ori)
 
             with torch.no_grad():
                 out = self.pipe(
@@ -293,17 +336,17 @@ class PGDAttackVAEInpaint:
             )
             similarities.append(sim)
             
-            sim_ori = self._compute_identity_similarity_masked(
-                pil_orig, gen_ori, mask, mask
-            )
-            similarities.append(sim_ori)
+            # sim_ori = self._compute_identity_similarity_masked(
+            #     pil_orig, gen_ori, mask, mask
+            # )
+            # similarities.append(sim_ori)
 
         result = {
             "original_images": original_images.detach().cpu(),
             "perturbed_images": perturbed_images,
             "masks": masks,
             "gen_orig" : gen_ori_list,
-            "gen_adv": gen_adv_list,
+            # "gen_adv": gen_adv_list,
             "identity_similarity": similarities
         }
 
@@ -318,3 +361,7 @@ def l2_loss(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         scalar tensor (mean squared error)
     """
     return F.mse_loss(x, y)
+
+def ssim_loss(x,y):
+    
+    return 1.0 - ssim(x, y, data_range=1.0, size_average=True)
