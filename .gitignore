@@ -11,3 +11,4 @@ __pycache__/
 .vscode/
 
 # ml model
+debug_outputs
