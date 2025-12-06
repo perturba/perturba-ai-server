@@ -8,9 +8,9 @@ from pydantic import BaseModel, HttpUrl
 class FacePerturbRequest(BaseModel):
     jobId: int
     publicId: str
-    inputImageUrl: HttpUrl  #이미지 url
-    prompt: Optional[str] = ""  #stable diffusion prompt (없으면 "")
-
+    inputImageUrl: HttpUrl  # presigned GET URL
+    intensity: str = "MEDIUM"
+    prompt: Optional[str] = ""
 
 #response
 class AcceptedResponse(BaseModel):

@@ -5,7 +5,9 @@ from io import BytesIO
 import requests
 from PIL import Image
 import torch
+from pathlib import Path
 
+import numpy as np
 from app.config import settings
 from app.models.dto import FacePerturbRequest
 from app.services.pgd_service import get_pgd_service
@@ -13,6 +15,8 @@ from app.clients import spring_client
 
 logger = logging.getLogger(__name__)
 
+DEBUG_DIR = Path("debug_outputs")
+DEBUG_DIR.mkdir(exist_ok=True)
 
 #동시에 돌아가는 Job 개수 제한
 concurrency_semaphore = threading.Semaphore(settings.MAX_CONCURRENCY)
@@ -29,13 +33,38 @@ def _download_image(url: str) -> Image.Image:
 
 
 #---------------------------------------------
-#PIL 이미지 → 실제 전송 가능한 PNG 바이트로 바꿈
+#PIL 이미지를 JPEG 바이트로 변환.
+# - 알파채널 있으면 흰 배경으로 합성
+# - mode가 RGB가 아니면 RGB로 변환
 #---------------------------------------------
-def _pil_to_png_bytes(img: Image.Image) -> bytes:
+def _pil_to_jpeg_bytes(img: Image.Image) -> bytes:
+    # 알파 채널 제거 (RGBA, LA 등)
+    if img.mode in ("RGBA", "LA"):
+        background = Image.new("RGB", img.size, (255, 255, 255))
+        background.paste(img, mask=img.split()[-1])  # alpha 채널로 합성
+        img = background
+    elif img.mode != "RGB":
+        img = img.convert("RGB")
+
     buf = BytesIO()
-    img.save(buf, format="PNG")
+    img.save(buf, format="JPEG", quality=95, optimize=True)
     buf.seek(0)
     return buf.getvalue()
+
+#---------------------
+#JPEG 저장용: 모드 정리
+#---------------------
+def _save_debug_jpeg(img: Image.Image, filename: str) -> None:
+    if img.mode in ("RGBA", "LA"):
+        bg = Image.new("RGB", img.size, (255, 255, 255))
+        bg.paste(img, mask=img.split()[-1])
+        img = bg
+    elif img.mode != "RGB":
+        img = img.convert("RGB")
+
+    out_path = DEBUG_DIR / filename
+    img.save(out_path, format="JPEG", quality=95)
+    logger.info(f"Saved debug image: {out_path}")
 
 
 #--------------------------------------------------------------
@@ -97,6 +126,7 @@ def process_face_perturb_job(req: FacePerturbRequest) -> None:
             #PGD + Inpainting 결과 얻기 (raw result 활용)
             result = service.run_attack_raw(
                 input_img,
+                intensity=req.intensity,
                 prompt=req.prompt or "",
             )
 
@@ -104,12 +134,14 @@ def process_face_perturb_job(req: FacePerturbRequest) -> None:
             original_images = result["original_images"]
             perturbed_images = result["perturbed_images"]
             gen_adv_list = result["gen_adv"]
+            gen_orig_list = result["gen_orig"]
             identity_sims = result["identity_similarity"]
 
             #B=1 전제
             orig_tensor: torch.Tensor = original_images[0]
             pert_tensor: torch.Tensor = perturbed_images[0]
             deepfake_img = gen_adv_list[0]
+            orig_inpaint_img = gen_orig_list[0]
 
             #perturbed : PGD 후 이미지 (torch -> PIL)
             perturbed_img = _tensor_to_pil(pert_tensor)
@@ -122,6 +154,14 @@ def process_face_perturb_job(req: FacePerturbRequest) -> None:
             if identity_sim is not None:
                 logger.info(f"[Job {req.jobId}] identity_similarity (adv vs orig_inpainted): {identity_sim:.4f}")
 
+
+            try:
+                _save_debug_jpeg(deepfake_img, f"job-{req.jobId}-deepfake-adv.jpg")
+                _save_debug_jpeg(orig_inpaint_img, f"job-{req.jobId}-deepfake-orig.jpg")
+            except Exception as e:
+                logger.warning(f"[Job {req.jobId}] Failed to save debug images locally: {e}")
+
+
             #스프링에서 결과 업로드용 presigned URL 발급
             resp_data = spring_client.request_result_upload_urls(req)
             perturbed_item = resp_data.data.perturbed
@@ -130,7 +170,7 @@ def process_face_perturb_job(req: FacePerturbRequest) -> None:
 
             #presigned URL로 업로드
             #perturbed
-            perturbed_bytes = _pil_to_png_bytes(perturbed_img)
+            perturbed_bytes = _pil_to_jpeg_bytes(perturbed_img)
             perturbed_headers = _flatten_headers(perturbed_item.headers)
             logger.info(f"[Job {req.jobId}] Uploading perturbed to S3...")
             resp = requests.request(
@@ -143,7 +183,7 @@ def process_face_perturb_job(req: FacePerturbRequest) -> None:
             resp.raise_for_status()
 
             #deepfake (gen_adv)
-            deepfake_bytes = _pil_to_png_bytes(deepfake_img)
+            deepfake_bytes = _pil_to_jpeg_bytes(deepfake_img)
             deepfake_headers = _flatten_headers(deepfake_item.headers)
             logger.info(f"[Job {req.jobId}] Uploading deepfake to S3...")
             resp = requests.request(
@@ -156,7 +196,7 @@ def process_face_perturb_job(req: FacePerturbRequest) -> None:
             resp.raise_for_status()
 
             #perturbationVis
-            perturb_vis_bytes = _pil_to_png_bytes(perturb_vis_img)
+            perturb_vis_bytes = _pil_to_jpeg_bytes(perturb_vis_img)
             perturb_vis_headers = _flatten_headers(perturb_vis_item.headers)
             logger.info(f"[Job {req.jobId}] Uploading perturbationVis to S3...")
             resp = requests.request(

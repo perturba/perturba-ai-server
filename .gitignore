@@ -11,4 +11,3 @@ __pycache__/
 .vscode/
 
 # ml model
-pgd.py
